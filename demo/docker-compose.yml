@@ -1,0 +1,314 @@
+version: '3.8'
+
+services:
+  # # Tempo runs as user 10001, and docker compose creates the volume as root.
+  # # As such, we need to chown the volume in order for Tempo to start correctly.
+  # init:
+  #   image: busybox:latest
+  #   user: root
+  #   entrypoint:
+  #     - "chown"
+  #     - "10001:10001"
+  #     - "/var/tempo"
+  #   volumes:
+  #     - tempo_data:/var/tempo
+
+  # Init container to create all config files
+  config-init:
+    image: alpine:latest
+    container_name: config-init
+    volumes:
+      - prometheus_config:/prometheus_config
+      - loki_config:/loki_config
+      - loki_data:/loki_data
+      - tempo_config:/tempo_config
+      - tempo_data:/tempo_data
+      - grafana_provisioning:/grafana_provisioning
+    command:
+      - /bin/sh
+      - -c
+      - |
+        cat > /prometheus_config/prometheus.yml <<'EOF'
+        global:
+          scrape_interval: 15s
+          evaluation_interval: 15s
+          external_labels:
+            cluster: 'local'
+            replica: 'prometheus-1'
+        scrape_configs:
+          - job_name: 'prometheus'
+            static_configs:
+              - targets: ['localhost:9090']
+          - job_name: 'frontend-service'
+            static_configs:
+              - targets: ['frontend:8001']
+            scrape_interval: 5s
+          - job_name: 'backend-service'
+            static_configs:
+              - targets: ['backend:8002']
+            scrape_interval: 5s
+          - job_name: 'database-service'
+            static_configs:
+              - targets: ['database:8003']
+            scrape_interval: 5s
+        EOF
+        
+        cat > /loki_config/local-config.yaml <<'EOF'
+        auth_enabled: false
+        server:
+          http_listen_port: 3100
+          grpc_listen_port: 9096
+        common:
+          instance_addr: 127.0.0.1
+          path_prefix: /loki
+          storage:
+            filesystem:
+              chunks_directory: /loki/chunks
+              rules_directory: /loki/rules
+          replication_factor: 1
+          ring:
+            kvstore:
+              store: inmemory
+        query_range:
+          results_cache:
+            cache:
+              embedded_cache:
+                enabled: true
+                max_size_mb: 100
+        schema_config:
+          configs:
+            - from: 2020-10-24
+              store: boltdb-shipper
+              object_store: filesystem
+              schema: v11
+              index:
+                prefix: index_
+                period: 24h
+        ruler:
+          alertmanager_url: http://localhost:9093
+        limits_config:
+          allow_structured_metadata: false
+        EOF
+        
+        cat > /tempo_config/tempo-config.yml <<'EOF'
+        server:
+          http_listen_port: 3200
+        distributor:
+          receivers:
+            otlp:
+              protocols:
+                grpc:
+                  endpoint: 0.0.0.0:4317
+                http:
+                  endpoint: 0.0.0.0:4318
+        ingester:
+          max_block_duration: 5m
+        compactor:
+          compaction:
+            block_retention: 1h
+            compacted_block_retention: 10m
+        storage:
+          trace:
+            backend: local
+            local:
+              path: /var/tempo/traces
+            pool:
+              max_workers: 100
+              queue_depth: 10000
+        overrides:
+          ingestion_burst_size_bytes: 15000000
+          ingestion_rate_limit_bytes: 15000000
+        EOF
+        
+        mkdir -p /grafana_provisioning/datasources
+        cat > /grafana_provisioning/datasources/datasources.yml <<'EOF'
+        apiVersion: 1
+        datasources:
+          - name: Prometheus
+            uid: prometheus
+            type: prometheus
+            access: proxy
+            url: http://prometheus:9090
+            isDefault: true
+            editable: true
+          - name: Loki
+            uid: loki
+            type: loki
+            access: proxy
+            url: http://loki:3100
+            editable: true
+          - name: Tempo
+            uid: tempo
+            type: tempo
+            access: proxy
+            url: http://tempo:3200
+            editable: true
+        EOF
+        
+        # Create directories with proper permissions
+        mkdir -p /loki_data/chunks /loki_data/rules
+        chmod -R 777 /loki_data
+        mkdir -p /tempo_data/traces
+        chmod -R 777 /tempo_data
+        
+        echo 'Configs created successfully'
+    networks:
+      - observability
+
+  # Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - prometheus_config:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - observability
+    depends_on:
+      - config-init
+    restart: unless-stopped
+
+  # Loki for logs
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki_config:/etc/loki:ro
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    networks:
+      - observability
+    depends_on:
+      - config-init
+    restart: unless-stopped
+
+  # Tempo for traces
+  tempo:
+    image: grafana/tempo:latest
+    container_name: tempo
+    ports:
+      - "3200:3200"   # tempo
+      - "4317:4317"   # otlp grpc
+      - "4318:4318"   # otlp http
+    volumes:
+      - tempo_config:/etc/tempo:ro
+      - tempo_data:/var/tempo
+    command: ["-config.file=/etc/tempo/tempo-config.yml"]
+    networks:
+      - observability
+    depends_on:
+      - config-init
+    restart: unless-stopped
+
+  # Grafana for visualization (optional but useful)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+      - GF_FEATURE_TOGGLES_ENABLE=traceqlEditor
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - grafana_provisioning:/etc/grafana/provisioning:ro
+    networks:
+      - observability
+    depends_on:
+      - config-init
+      - prometheus
+      - loki
+      - tempo
+    restart: unless-stopped
+
+  # Database Service - Simulates database operations with full telemetry
+  database:
+    build:
+      context: /Users/akdo/Documents/Projects/grafana-ai-agent/demo/apps/database
+      dockerfile: Dockerfile
+    container_name: database
+    ports:
+      - "8003:8003"
+    networks:
+      - observability
+    depends_on:
+      - loki
+      - tempo
+      - prometheus
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Backend API Service - Processes business logic with full telemetry
+  backend:
+    build:
+      context: /Users/akdo/Documents/Projects/grafana-ai-agent/demo/apps/backend
+      dockerfile: Dockerfile
+    container_name: backend
+    ports:
+      - "8002:8002"
+    networks:
+      - observability
+    depends_on:
+      - database
+      - loki
+      - tempo
+      - prometheus
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Frontend Service - User-facing service with full telemetry
+  frontend:
+    build:
+      context: /Users/akdo/Documents/Projects/grafana-ai-agent/demo/apps/frontend
+      dockerfile: Dockerfile
+    container_name: frontend
+    ports:
+      - "8001:8001"
+    networks:
+      - observability
+    depends_on:
+      - backend
+      - loki
+      - tempo
+      - prometheus
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  prometheus_data:
+  prometheus_config:
+  loki_data:
+  loki_config:
+  tempo_data:
+  tempo_config:
+  grafana_data:
+  grafana_provisioning:
+
+networks:
+  observability:
+    driver: bridge
